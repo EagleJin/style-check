@@ -1,0 +1,170 @@
+#!/bin/sh
+#
+export LANG="en_US.UTF-8"
+REJECT=0
+JAVA_HOME=/usr/local/java/jdk1.8.0_172
+CHECK_JAR_HOME=/opt/gitlab/embedded/service/gitlab-shell/hooks/pre-receive.d
+# 要放过的代码仓库名称
+array_pass_repository_name=("inner-test11.git" "inner-test21.git")
+# 要放过的代码仓库组名称
+array_pass_group_name=("framework1" "")
+# 要放过的生成代码包名
+array_pass_package_name=("webservice" "")
+declare -A dict
+while read oldrev newrev refname; do
+    if [ "$oldrev" = "0000000000000000000000000000000000000000" ];then
+        oldrev="${newrev}^"
+    fi
+   
+    # 跳过工程第一次提交 操作 
+    operate_log=`git log ${oldrev}..${newrev} --pretty="%h ${refname} %B"`
+    if [[ $operate_log =~ "Init Project" ]];then
+         echo "init push pass.."
+         continue
+    fi
+    # 跳过merge request 操作
+    if [[ $operate_log =~ "merge request" ]];then
+         echo "***merge request** continue"
+         continue
+    fi
+
+    files=`git diff --name-only ${oldrev} ${newrev} | grep -e ".java$"`
+    if [ -n "$files" ];then
+        TEMPDIR="tmp"
+        for file in ${files}; do
+            # 文件仓库地址
+            file_repository_path=`pwd`/${file}
+            
+            # 1.优先判断仓库组
+            sub_path=${file_repository_path#*repositories/}
+            echo "sub_path==="$sub_path
+            group_name=${sub_path%%/*}
+            echo "group_name====="$group_name
+            # 判断白名单中是否包含要检查的仓库名称
+            contain=$(echo "${array_pass_group_name[@]}" | grep -wq "$group_name" && echo "Yes" ||  echo "No")
+            
+            if [[ $contain == "Yes" ]]; then
+                echo 'white list pass...repository group name is '${group_name}
+                continue
+            fi
+
+            # 2.判断仓库名称
+            sub_str=${file_repository_path%.git/*}
+            echo "sub_str=="$sub_str
+            repository_name=${sub_str##*/}
+            echo "repository_name=="$repository_name
+            name_contain=$(echo "${array_pass_repository_name[@]}" | grep -wq "$repository_name" && echo "Yes" ||  echo "No")
+            
+            if [[ $name_contain == "Yes" ]]; then
+                echo 'white list pass...repository name is '${repository_name}
+                continue
+            fi
+            
+            # 3.判断生成的代码
+            contain=0
+            file_path=${file_repository_path#*repositories/} 
+            echo "file_path>>"$file_path
+            for value in ${array_pass_package_name[@]}
+            do
+                if [[ $file_path =~ $value ]];then 
+                    echo ">>contain<<"$value
+                    contain=1
+                fi
+            done
+            if [[ $contain == 1 ]];then
+                echo "contain>>pass.."
+                continue
+            fi
+
+
+            mkdir -p "${TEMPDIR}/`dirname ${file}`" > /dev/null
+            
+            git show $newrev:$file > ${TEMPDIR}/${file}
+            filename=${file##*/}
+            key=${filename%.*}
+            value=`git diff $oldrev $newrev -- ${file} | grep -e '@@'`
+            #echo "key==>>"$key
+            echo "value==>"$value
+            dict+=([$key]=$value)
+        done;
+        echo "dict_all_keys-->>>"${!dict[*]}
+        files_to_check=`find $TEMPDIR -name '*.java'`
+        if [ ! -n "$files_to_check" ];then
+            echo 'pass....'
+        else
+            echo -e "p3c-pmd check starting......"
+
+            result=`$JAVA_HOME/bin/java -cp $CHECK_JAR_HOME/p3c-pmd-2.0.1.jar net.sourceforge.pmd.PMD -d $TEMPDIR -R rulesets/java/ali-comment.xml,rulesets/java/ali-concurrent.xml,rulesets/java/ali-constant.xml,rulesets/java/ali-exception.xml,rulesets/java/ali-flowcontrol.xml,rulesets/java/ali-naming.xml,rulesets/java/ali-oop.xml,rulesets/java/ali-orm.xml,rulesets/java/ali-other.xml,rulesets/java/ali-set.xml -f text`
+            # 去掉文本中的空格
+            del_space=$(echo $result | sed 's/[[:space:]]//g')
+            # 文本中的/var替换为,
+            replace=$(echo $del_space | sed 's/\/var/,/g')
+            array_result=(${replace//,/ })
+            final_result=
+            for var in ${array_result[@]}
+            do
+                #echo $var
+                tmp_no=${var#*:}
+                line_no=${tmp_no%:*}
+                #echo "line_no=="$line_no
+                tmp_file_name=${var%.java*}
+                #echo "tmp_file_name>>"$tmp_file_name
+                file_name=${tmp_file_name##*/}
+                #echo "name=="$file_name
+                tmp_str=${dict[$file_name]}
+                if [ -z "$tmp_str" ];then
+                    echo "value is null.."
+                    continue
+                fi
+                array_tmp_commit=(${tmp_str//@@/ })
+                for tmp in ${array_tmp_commit[@]}
+                do
+                    if [[ $tmp =~ "+" ]];then
+                        #echo "contain + >>>"$tmp
+                        v_commit=${tmp#*+}
+                        #echo "v_commit=="$v_commit
+                        array_no=(${v_commit//,/ })
+                        #echo "a_no[0]=="${array_no[0]}
+                        #echo "a_no[1]=="${array_no[1]}
+                        if [ "${array_no[0]}" -gt 0 ];then
+                            #echo "gt"
+                            start_no=$[${array_no[0]}+2]
+                            end_no=$[${array_no[0]}+${array_no[1]}-2]
+                            #echo "start_no=="$start_no">><<end_no==="$end_no
+                            if [ $line_no -gt $start_no -a $line_no -le $end_no ];then
+                                #echo "hit.."
+                                final_result=$final_result","$var
+                            fi   
+                        else
+                            echo "TODO lt 0"
+                        fi
+                    fi
+                 done
+            done
+            #$JAVA_HOME/bin/java -cp $CHECK_JAR_HOME/p3c-pmd-2.0.1.jar net.sourceforge.pmd.PMD -d $TEMPDIR -R rulesets/java/ali-comment.xml,rulesets/java/ali-concurrent.xml,rulesets/java/ali-constant.xml,rulesets/java/ali-exception.xml,rulesets/java/ali-flowcontrol.xml,rulesets/java/ali-naming.xml,rulesets/java/ali-oop.xml,rulesets/java/ali-orm.xml,rulesets/java/ali-other.xml,rulesets/java/ali-set.xml -f text
+            if [ -z "$final_result" ];then
+                REJECT=0
+            else
+                REJECT=1
+                array_text=(${final_result//,/ })
+                for text in ${array_text[@]}
+                do
+                    echo -e $text
+                done
+            fi
+            #REJECT=$?
+
+            echo -e "p3c-pmd check end......"
+
+            if [[ $REJECT == 0 ]] ;then
+               echo -e "恭喜你代码通过质量检测！"
+            else
+               echo -e "请及时修改代码并再次尝试!!"
+            fi
+
+            rm -rf $TEMPDIR
+        fi
+    fi
+done
+
+exit $REJECT
